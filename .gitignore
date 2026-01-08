@@ -1,0 +1,11 @@
+.DS_Store
+
+.vscode/
+
+odin
+!odin/
+**/*.dSYM
+*.bin
+demo.bin
+libLLVM*.so*
+*.a
