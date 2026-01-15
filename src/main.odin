@@ -3,8 +3,8 @@ package main
 import "core:fmt"
 
 // 1. The Constants (The Rules of the Universe)
-SMALL_CAP :: 3
-BIG_CAP :: 5
+SMALL_JUG_CAP :: 3
+BIG_JUG_CAP :: 5
 TARGET :: 4
 
 // 2. The State Vector
@@ -89,10 +89,10 @@ next_states :: proc(s: State) -> [dynamic]State {
 	states := make([dynamic]State)
 
 	// Rule 1: Fill Small Jug
-	append(&states, State{Gallons(SMALL_CAP), s.big})
+	append(&states, State{Gallons(SMALL_JUG_CAP), s.big})
 
 	// Rule 2: Fill Big Jug
-	append(&states, State{s.small, Gallons(BIG_CAP)})
+	append(&states, State{s.small, Gallons(BIG_JUG_CAP)})
 
 	// Rule 3: Empty Small Jug
 	append(&states, State{0, s.big})
@@ -105,7 +105,7 @@ next_states :: proc(s: State) -> [dynamic]State {
 	// This requires a bit of math (min/max).
 	// Let's implement this logic explicitly.
 	{
-		amount_to_pour := min(s.small, BIG_CAP - s.big)
+		amount_to_pour := min(s.small, BIG_JUG_CAP - s.big)
 		new_small := s.small - amount_to_pour
 		new_big := s.big + amount_to_pour
 		append(&states, State{Gallons(new_small), Gallons(new_big)})
@@ -113,7 +113,7 @@ next_states :: proc(s: State) -> [dynamic]State {
 
 	// Rule 6: Big to Small
 	{
-		amount_to_pour := min(s.big, SMALL_CAP - s.small)
+		amount_to_pour := min(s.big, SMALL_JUG_CAP - s.small)
 		new_small := s.small + amount_to_pour
 		new_big := s.big - amount_to_pour
 		append(&states, State{Gallons(new_small), Gallons(new_big)})
