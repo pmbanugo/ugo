@@ -2,136 +2,120 @@ package main
 
 import "core:fmt"
 
-// 1. The Constants (The Rules of the Universe)
-SMALL_JUG_CAP :: 3
-BIG_JUG_CAP :: 5
-TARGET :: 4
-
-// 2. The State Vector
-// We use 'distinct' to ensure we don't accidentally mix up gallons with other integers.
-Gallons :: distinct int
-
-State :: struct {
-	small: Gallons,
-	big:   Gallons,
+// The Atomic Unit of Data
+// In TLA, everything is avalue. In our VM, we support these primitives.
+Value :: union {
+	int,
+	bool,
 }
 
+// The Generic State
+// Instead of named fields, we use a "Register file".
+// E.g. In the water jugs problem, index 0 might be "small", index 1 might be "big".
+State :: struct {
+	registers: [dynamic]Value,
+}
+
+// Helper: Deep copy a state because [dynamic] arrays are pointers internally,
+clone_state :: proc(s: State) -> State {
+	new_state := State {
+		registers = make([dynamic]Value, len(s.registers)),
+	}
+
+	for value, index in s.registers {
+		new_state.registers[index] = value
+	}
+	return new_state
+}
+
+print_state :: proc(state: State) {
+	fmt.print("[")
+	for value, index in state.registers {
+		if index > 0 do fmt.print(", ")
+		switch val in value {
+		case int:
+			fmt.printf("%d", val)
+		case bool:
+			fmt.printf("%t", val)
+		}
+		// fmt.printf("{}")
+	}
+	fmt.println(" ]")
+}
+
+// The Instruction Set
+OpCode :: enum {
+	ASSIGN, // reg[target] = operand (Constant)
+	ADD, // reg[target] = reg[src] + operand (Constant)
+	SUB, // reg[target] = reg[src] - operand (Constant)
+}
+
+Instruction :: struct {
+	op:     OpCode,
+	target: int, // index of register to write to
+	source: int, // index of register to read from (if needed)
+	amount: int, // immediate value (literal)
+}
+
+// The Evaluator (The VM core)
+// Execute a single instruction on a state
+execute :: proc(s: ^State, instruction: Instruction) {
+	// Switch on OpCode to decide behaviour
+	switch instruction.op {
+	case .ASSIGN:
+		s.registers[instruction.target] = instruction.amount
+	case .ADD:
+		// We need to extract the integer from the union.
+		// If it's not an int, this crashes (or we handle error).
+		// syntax: val.(Type) asserts the type.
+		current_value := s.registers[instruction.source].(int)
+		s.registers[instruction.target] = current_value + instruction.amount
+
+	case .SUB:
+		current_value := s.registers[instruction.source].(int)
+		s.registers[instruction.target] = current_value - instruction.amount
+	}
+}
+
+// Test driver
 main :: proc() {
-	initial_state := State{0, 0}
-	fmt.printf("Goal: Reach %d gallons in the big jug.\n", TARGET)
-	fmt.println("Initial State: ")
+	// 1. Initialize state [0, 0] by allocating 2 slots
+	initial_state := State{make([dynamic]Value, 2)}
+	initial_state.registers[0] = 0 // Small
+	initial_state.registers[1] = 0 // Big
+
+	fmt.print("Initial: ")
 	print_state(initial_state)
 
-	// 1. Queue for Breadth-first search (BFS)
-	queue := make([dynamic]State)
-	defer delete(queue)
-	append(&queue, initial_state)
+	// 2. Define a proram
+	// Goal: small := 3; big := big + 5;
+	program := make([dynamic]Instruction, 2)
+	program[0] = {
+		op     = .ASSIGN,
+		target = 0,
+		amount = 3,
+	} // small = 3
+	program[1] = {
+		op     = .ADD,
+		target = 1,
+		source = 1,
+		amount = 5,
+	} // big = big + 5
+	defer delete(program)
 
-	// 2. Visited map (State -> Parent Sate)
-	// We use this to reconstruct the path later.
-	// If a state is in this map, it has been visited.
-	visited := make(map[State]State)
-	defer delete(visited)
+	// 3. Run the VM
+	// We clone the initial_state so we don't destroy the original
+	next_state := clone_state(initial_state)
 
-	// Mark initial state as visited
-	// We use the initial state as its own parent to mark the start.
-	visited[initial_state] = initial_state
-
-	fmt.println("Starting Solver...")
-
-	found := false
-	final_state: State
-
-	// BFS loop
-	for len(queue) > 0 {
-		// Pop from front (inefficient in dynamic array, but fine for now)
-		current := queue[0]
-		ordered_remove(&queue, 0) // Removes index 0 and shifts everything down
-
-		// INVARIANT CHECK: Did we win?
-		if current.big == TARGET {
-			fmt.println("SOLVED! Found a state with 4 gallons.")
-			final_state = current
-			found = true
-			break
-		}
-
-		// Generate next states
-		next_candidates := next_states(current)
-		defer delete(next_candidates) //Clean up the temporary list from get_next_states()
-
-		for next in next_candidates {
-			// Check if we have seen this state before
-			if next in visited {
-				continue
-			}
-
-			// New state found!
-			visited[next] = current // Record path
-			append(&queue, next)
-		}
+	fmt.println("Running the programm...")
+	for instruction in program {
+		execute(&next_state, instruction)
 	}
 
-	if found {
-		print_trace(final_state, visited)
-	} else {
-		fmt.println("Impossible to solve.")
-	}
-}
+	fmt.print("Final:   ")
+	print_state(next_state)
 
-// Helper to print state nicely
-print_state :: proc(s: State) {
-	fmt.printf("[ small: {}, big: {} ]\n", s.small, s.big)
-}
-
-// Returns a list of all possible next states from a given state
-next_states :: proc(s: State) -> [dynamic]State {
-	states := make([dynamic]State)
-
-	// Rule 1: Fill Small Jug
-	append(&states, State{Gallons(SMALL_JUG_CAP), s.big})
-
-	// Rule 2: Fill Big Jug
-	append(&states, State{s.small, Gallons(BIG_JUG_CAP)})
-
-	// Rule 3: Empty Small Jug
-	append(&states, State{0, s.big})
-
-	// Rule 4: Empty Big Jug
-	append(&states, State{s.small, 0})
-
-	// Rule 5: Small to Big
-	// We pour from small to big until either small is empty OR big is full.
-	// This requires a bit of math (min/max).
-	// Let's implement this logic explicitly.
-	{
-		amount_to_pour := min(s.small, BIG_JUG_CAP - s.big)
-		new_small := s.small - amount_to_pour
-		new_big := s.big + amount_to_pour
-		append(&states, State{Gallons(new_small), Gallons(new_big)})
-	}
-
-	// Rule 6: Big to Small
-	{
-		amount_to_pour := min(s.big, SMALL_JUG_CAP - s.small)
-		new_small := s.small + amount_to_pour
-		new_big := s.big - amount_to_pour
-		append(&states, State{Gallons(new_small), Gallons(new_big)})
-	}
-
-	return states
-}
-
-print_trace :: proc(end: State, parents: map[State]State) {
-	if end == parents[end] {
-		// We reached the start
-		print_state(end)
-		return
-	}
-
-	parent := parents[end]
-	print_trace(parent, parents) // Recurse first to print in order
-	fmt.println("   |   ")
-	fmt.println("   v   ")
-	print_state(end)
+	//Cleanup
+	delete(initial_state.registers)
+	delete(next_state.registers)
 }
