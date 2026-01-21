@@ -9,3 +9,6 @@ odin
 demo.bin
 libLLVM*.so*
 *.a
+
+# private
+*.note.*
