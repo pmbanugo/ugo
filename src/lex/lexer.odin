@@ -19,7 +19,7 @@ Interner :: struct {
 }
 
 init_interner :: proc(interner: ^Interner, allocator := context.allocator) {
-	//Initialise map with a reasonable capacity to avoid early resizing
+	// Initialise map with a reasonable capacity to avoid early resizing
 	interner.lookup = make(map[string]core.String_Id, 1024, allocator)
 	interner.table = make([dynamic]string, allocator)
 
@@ -52,20 +52,29 @@ intern :: proc(interner: ^Interner, text: string) -> core.String_Id {
   --------------------------
 */
 
+// Whitespace bitset for O(1) membership testing (Stolen from Odin core)
+// Only allows for ASCII whitespace
+// utf8.RUNE_SELF is 0x80 (128), so '..<' means 0 to 127
+Whitespace :: distinct bit_set['\x00'..<utf8.RUNE_SELF; u128]
+IS_WHITESPACE :: Whitespace{' ', '\t', '\r', '\n'}
+
 Lexer :: struct {
-	source:      string,
-	interner:    ^Interner,
+	source:       string,
+	interner:     ^Interner,
 
 	// stores the result as #soa [dynamic]Token:
 	// 1 Cache Locality: 'Kind' array is packed tight for the Parser.
 	// 2. Simplicity: Easier to use than Xar for this access pattern, and possible SIMD ops
-	tokens:      #soa[dynamic]Token,
+	tokens:       #soa[dynamic]Token,
 
-	// Keep these offset fields as int because Odin's slice indexing requires int.
-	// Casting every time we peek() or advance() would be noisy and inefficient.
-	offset:      int, // current byte offset
-	read_offset: int, // next byte offset
-	character:   rune, // current unicode character
+	// A side-table of line-start offsets.
+	// Used to calculate Line:Column on demand without bloating the Token struct.
+	line_offsets: [dynamic]u32,
+
+	// Internal offsets are u32 to match core.Span, avoiding casts in the tokenize loop.
+	offset:       u32, // current byte offset
+	read_offset:  u32, // next byte offset
+	character:    rune, // current unicode character
 }
 
 init_lexer :: proc(
@@ -81,58 +90,81 @@ init_lexer :: proc(
 	lexer.source = source
 	lexer.interner = interner
 
-	// Pre-allocate SOA storage
+	// Pre-allocate storage
 	lexer.tokens = make(#soa[dynamic]Token, 0, 1024, allocator)
+	lexer.line_offsets = make([dynamic]u32, 0, 128, allocator)
+
+	// Line 1 always starts at offset 0
+	append(&lexer.line_offsets, 0)
 
 	// Prime the lexer state
 	lexer.offset = 0
 	lexer.read_offset = 0
+
+	// Skip UTF-8 BOM if present
+	if len(lexer.source) >= 3 && lexer.source[0:3] == "\xEF\xBB\xBF" {
+		lexer.read_offset = 3
+	}
+
 	advance(lexer)
 }
 
 destroy_lexer :: proc(lexer: ^Lexer) {
 	delete(lexer.tokens)
+	delete(lexer.line_offsets)
 }
 
 // advance consumes the current character and loads the next.
 // Updates offset, read_offset and character.
 advance :: proc(lexer: ^Lexer) {
-	if lexer.read_offset >= len(lexer.source) {
+	// If the current character we are leaving is a newline, the next char starts a new line.
+	if lexer.character == '\n' {
+		append(&lexer.line_offsets, lexer.read_offset)
+	}
+
+	if int(lexer.read_offset) >= len(lexer.source) {
 		lexer.character = 0 // EOF sentinel
-		lexer.offset = len(lexer.source)
-		lexer.read_offset = len(lexer.source) + 1
+		lexer.offset = u32(len(lexer.source))
+		lexer.read_offset = u32(len(lexer.source) + 1)
 	} else {
 		lexer.offset = lexer.read_offset
-		r, w := utf8.decode_rune_in_string(lexer.source[lexer.read_offset:])
+
+		// Indexing requires int, but we keep internal offsets as u32.
+		// We cast to int here (once per character) to support library calls.
+		r, w := utf8.decode_rune_in_string(lexer.source[int(lexer.read_offset):])
 		lexer.character = r
-		lexer.read_offset += w
+		lexer.read_offset += u32(w)
 	}
 }
 
 // returns the next character without advancing the state
 peek :: proc(lexer: ^Lexer) -> rune {
-	if lexer.read_offset >= len(lexer.source) do return 0
-	r, _ := utf8.decode_rune_in_string(lexer.source[lexer.read_offset:])
+	if int(lexer.read_offset) >= len(lexer.source) do return 0
+	r, _ := utf8.decode_rune_in_string(lexer.source[int(lexer.read_offset):])
 	return r
 }
+
 // "Push For loops Down": Consumes all non-token text (whitespace & comments).
 // It centralizes the logic for "skipping stuff" so the main loop is clean.
 skip_whitespace_and_comments :: proc(lexer: ^Lexer) {
 	loop: for {
-		switch lexer.character {
-		case ' ', '\t', '\r', '\n':
-			// Consume whitespace run
+		// Use bit-set for fast whitespace check
+		if lexer.character < 128 && lexer.character in IS_WHITESPACE {
 			advance(lexer)
+			continue
+		}
 
-		case '/':
-			if peek(lexer) == '/' {
+		if lexer.character == '/' {
+			next := peek(lexer)
+			if next == '/' {
 				// Line comment: consume until newline
 				advance(lexer)
 				advance(lexer)
 				for lexer.character != '\n' && lexer.character != 0 {
 					advance(lexer)
 				}
-			} else if peek(lexer) == '*' {
+				continue
+			} else if next == '*' {
 				// Block comment: consume until */
 				advance(lexer)
 				advance(lexer)
@@ -144,21 +176,18 @@ skip_whitespace_and_comments :: proc(lexer: ^Lexer) {
 					}
 					advance(lexer)
 				}
-			} else {
-				// Stop because it's a Slash token, not a comment
-				break loop
+				continue
 			}
-
-		case:
-			break loop
 		}
+
+		break loop
 	}
 }
 
 // process the entire source string into the tokens array
 tokenize :: proc(lexer: ^Lexer) {
 	for lexer.character != 0 {
-		// 1. Consume non-token text (If pushed up to here, Fors pushed down into "skip_whitespace_and_comments()")
+		// 1. Consume non-token text
 		skip_whitespace_and_comments(lexer)
 		if lexer.character == 0 do break
 
@@ -224,7 +253,7 @@ tokenize :: proc(lexer: ^Lexer) {
 				kind = .And
 				advance(lexer)
 			} else {
-				kind = .Ampersand // Set intersection
+				kind = .Ampersand
 			}
 
 		case '|':
@@ -233,7 +262,7 @@ tokenize :: proc(lexer: ^Lexer) {
 				kind = .Or
 				advance(lexer)
 			} else {
-				kind = .Pipe // Set union / Type separator
+				kind = .Pipe
 			}
 
 		case '<':
@@ -241,7 +270,7 @@ tokenize :: proc(lexer: ^Lexer) {
 			if lexer.character == '=' {
 				advance(lexer)
 				if lexer.character == '>' {
-					kind = .Equivalence // <=>
+					kind = .Equivalence
 					advance(lexer)
 				} else {
 					kind = .Less_Than_Or_Equal
@@ -297,23 +326,20 @@ tokenize :: proc(lexer: ^Lexer) {
 		case '"':
 			kind = .String
 			advance(lexer)
-			// Consume string body
 			for lexer.character != '"' && lexer.character != 0 {
-				if lexer.character == '\\' do advance(lexer) // skip escape chacracter
+				if lexer.character == '\\' do advance(lexer)
 				advance(lexer)
 			}
 			if lexer.character == '"' do advance(lexer)
-		// (Optional) Intern string content here if needed
 
 		case:
 			if is_letter(lexer.character) {
 				// --- Identifier/Keyword ---
-				// "For" pushed down: Consume word
 				for is_letter(lexer.character) || is_digit(lexer.character) {
 					advance(lexer)
 				}
 
-				text := lexer.source[start:lexer.offset]
+				text := lexer.source[int(start):int(lexer.offset)]
 				kind = resolve_keyword(text)
 
 				if kind == .Identifier {
@@ -323,32 +349,46 @@ tokenize :: proc(lexer: ^Lexer) {
 
 			} else if is_digit(lexer.character) {
 				// --- Integer Literal ---
-				// "For" pushed down: Consume digits
 				kind = .Integer
 				for is_digit(lexer.character) {
 					advance(lexer)
 				}
-				// Payload remains 0. Parser will parse the int later
 			} else {
 				kind = .Invalid
 				advance(lexer)
 			}
 		}
 
-		// Append to SOA
 		append(
 			&lexer.tokens,
 			Token {
 				kind = kind,
-				// Explicit cast to u32. We know this is safe due to the init_lexer assertion.
-				span = core.Span{offset = u32(start), length = u32(lexer.offset - start)},
+				span = core.Span{offset = start, length = lexer.offset - start},
 				payload = payload,
 			},
 		)
 	}
 
-	// Append EOF token for parser convenience
-	append(&lexer.tokens, Token{kind = .EOF, span = {u32(lexer.offset), 0}})
+	// Append EOF token
+	append(&lexer.tokens, Token{kind = .EOF, span = {lexer.offset, 0}})
+}
+
+// --- Position Helper (Side-Table Query) ---
+// This is only called when reporting errors, keeping the hot path clean.
+get_position :: proc(lexer: ^Lexer, offset: u32) -> (line: u32, column: u32) {
+	line = 1
+	line_start_offset: u32 = 0
+
+	// Binary search or linear scan through the side-table to find the line
+	for start_offset, idx in lexer.line_offsets {
+		if start_offset > offset do break
+		line = u32(idx + 1)
+		line_start_offset = start_offset
+	}
+
+	// Column is simply the delta from the start of the line
+	column = (offset - line_start_offset) + 1
+	return
 }
 
 // --- Helpers ---
